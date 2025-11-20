@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Flappy Bird Remake</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #333;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+            touch-action: none; /* Prevent mobile scrolling */
+            font-family: 'Courier New', Courier, monospace;
+        }
+
+        canvas {
+            display: block;
+            background-color: #70c5ce; /* Fallback sky color */
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            max-width: 100%;
+            max-height: 100%;
+        }
+
+        #loading {
+            position: absolute;
+            color: white;
+            font-size: 24px;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loading">Loading Assets...</div>
+    <canvas id="gameCanvas"></canvas>
+
+    <script>
+        // --- CONFIGURATION ---
+        const ASSETS = {
+            bird: 'bird.png',
+            bg: 'bg.png',
+            ground: 'ground.png',
+            pipeTop: 'pipe_top.png',       // The pipe hanging from the ceiling
+            pipeBottom: 'pipe_bottom.png', // The pipe standing on the ground
+            title: 'title.png',
+            get: 'get.png',
+            ready: 'ready.png',
+            tap: 'tap.png'
+        };
+
+        // Game Constants
+        const GRAVITY = 0.25;
+        const JUMP_STRENGTH = -4.6;
+        const PIPE_SPEED = 2; // Speed of the ground and pipes
+        const PIPE_SPAWN_RATE = 100; // Frames between pipes
+        const PIPE_GAP = 100; // Vertical gap between pipes
+        const GROUND_HEIGHT = 112; // Height of the ground sprite
+
+        // --- SETUP CANVAS ---
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        
+        // We'll work with a fixed logical resolution and scale it up
+        // Standard Flappy Bird resolution is roughly 288x512
+        const GAME_WIDTH = 288; 
+        const GAME_HEIGHT = 512;
+
+        let scale = 1;
+
+        function resize() {
+            const windowRatio = window.innerWidth / window.innerHeight;
+            const gameRatio = GAME_WIDTH / GAME_HEIGHT;
+
+            if (windowRatio < gameRatio) {
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerWidth / gameRatio;
+            } else {
+                canvas.height = window.innerHeight;
+                canvas.width = window.innerHeight * gameRatio;
+            }
+            
+            scale = canvas.width / GAME_WIDTH;
+            ctx.imageSmoothingEnabled = false; // Keep pixel art crisp
+        }
+
+        window.addEventListener('resize', resize);
+        resize();
+
+        // --- ASSET LOADING ---
+        const images = {};
+        let assetsLoaded = 0;
+        const totalAssets = Object.keys(ASSETS).length;
+
+        function loadImages(callback) {
+            for (let key in ASSETS) {
+                const img = new Image();
+                img.src = ASSETS[key];
+                img.onload = () => {
+                    assetsLoaded++;
+                    if (assetsLoaded === totalAssets) callback();
+                };
+                img.onerror = () => {
+                    console.warn(`Failed to load ${ASSETS[key]}. Using fallback.`);
+                    assetsLoaded++; // Proceed anyway using fallbacks
+                    if (assetsLoaded === totalAssets) callback();
+                };
+                images[key] = img;
+            }
+        }
+
+        // --- GAME VARIABLES ---
+        let frames = 0;
+        let score = 0;
+        let highScore = localStorage.getItem('flappy_highscore') || 0;
+        let state = {
+            current: 0,
+            getReady: 0,
+            game: 1,
+            over: 2
+        };
+
+        // --- SOUNDS (Synthesized for single-file portability) ---
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        function playSound(type) {
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+
+            if (type === 'flap') {
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(400, audioCtx.currentTime);
+                osc.frequency.exponentialRampToValueAtTime(600, audioCtx.currentTime + 0.1);
+                gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+                osc.start();
+                osc.stop(audioCtx.currentTime + 0.1);
+            } else if (type === 'score') {
+                osc.type = 'square';
+                osc.frequency.setValueAtTime(800, audioCtx.currentTime);
+                gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+                gain.gain.linearRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+                osc.start();
+                osc.stop(audioCtx.currentTime + 0.1);
+            } else if (type === 'hit') {
+                osc.type = 'sawtooth';
+                osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+                gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+                osc.start();
+                osc.stop(audioCtx.currentTime + 0.1);
+            }
+        }
+
+        // --- GAME OBJECTS ---
+
+        const bg = {
+            x: 0,
+            y: 0,
+            w: GAME_WIDTH,
+            h: GAME_HEIGHT,
+            draw: function() {
+                if (images.bg.complete && images.bg.naturalWidth !== 0) {
+                    ctx.drawImage(images.bg, this.x, this.y, this.w, this.h);
+                    // Draw a second one for continuity if needed, though usually BG is static or parallax
+                    // For simple flappy bird, BG is often static or moves very slowly. We'll keep it static like the original.
+                } else {
+                    ctx.fillStyle = '#70c5ce';
+                    ctx.fillRect(this.x, this.y, this.w, this.h);
+                }
+            }
+        };
+
+        const ground = {
+            x: 0,
+            y: GAME_HEIGHT - 112, // Approx height of ground sprite
+            w: GAME_WIDTH,
+            h: 112,
+            dx: 2,
+            draw: function() {
+                // We draw two ground images to create the infinite scroll effect
+                if (images.ground.complete && images.ground.naturalWidth !== 0) {
+                    // Draw first
+                    ctx.drawImage(images.ground, this.x, this.y, GAME_WIDTH + 10, this.h);
+                    // Draw second
+                    ctx.drawImage(images.ground, this.x + GAME_WIDTH, this.y, GAME_WIDTH + 10, this.h);
+                } else {
+                    ctx.fillStyle = '#ded895';
+                    ctx.fillRect(this.x, this.y, GAME_WIDTH, this.h);
+                    ctx.fillStyle = '#73bf2e';
+                    ctx.fillRect(this.x, this.y, GAME_WIDTH, 20); // Grass top
+                }
+            },
+            update: function() {
+                if (state.current === state.game || state.current === state.getReady) {
+                    this.x = (this.x - this.dx) % (GAME_WIDTH / 2); // Logic for seamless looping usually requires correct sprite width
+                    // Simplified loop:
+                    this.x -= PIPE_SPEED;
+                    if (this.x <= -GAME_WIDTH) {
+                        this.x = 0;
+                    }
+                }
+            }
+        };
+
+        const bird = {
+            animation: [0, 1, 2, 1],
+            x: 50,
+            y: 150,
+            w: 34,
+            h: 24,
+            frame: 0,
+            speed: 0,
+            rotation: 0,
+            radius: 12,
+            
+            draw: function() {
+                ctx.save();
+                ctx.translate(this.x, this.y);
+                // Rotation logic
+                ctx.rotate(this.rotation);
+                
+                if (images.bird.complete && images.bird.naturalWidth !== 0) {
+                    // Offset to center rotation
+                    ctx.drawImage(images.bird, -this.w/2, -this.h/2, this.w, this.h);
+                } else {
+                    // Fallback
+                    ctx.fillStyle = '#ffeb3b';
+                    ctx.beginPath();
+                    ctx.arc(0, 0, this.radius, 0, Math.PI*2);
+                    ctx.fill();
+                    ctx.fillStyle = 'white';
+                    ctx.beginPath();
+                    ctx.arc(8, -6, 6, 0, Math.PI*2);
+                    ctx.fill();
+                }
+                
+                ctx.restore();
+            },
+            
+            flap: function() {
+                this.speed = JUMP_STRENGTH;
+                playSound('flap');
+            },
+            
+            update: function() {
+                // If Get Ready state, hover
+                if (state.current === state.getReady) {
+                    this.y = 150 + Math.cos(frames/15) * 5; // Hover effect
+                    this.rotation = 0;
+                } 
+                // If Game State
+                else if (state.current === state.game) {
+                    this.speed += GRAVITY;
+                    this.y += this.speed;
+
+                    // Rotation logic
+                    if (this.speed < PIPE_SPEED && this.rotation > -25 * Math.PI / 180) {
+                        this.rotation = -25 * Math.PI / 180;
+                    } else if (this.speed > 0) {
+                        this.rotation += 2 * Math.PI / 180; // Rotate down slowly
+                        if (this.rotation > 90 * Math.PI / 180) {
+                            this.rotation = 90 * Math.PI / 180;
+                        }
+                    }
+
+                    // Floor Collision
+                    if (this.y + this.h/2 >= canvas.height/scale - ground.h) {
+                        this.y = canvas.height/scale - ground.h - this.h/2;
+                        state.current = state.over;
+                        playSound('hit');
+                    }
+                } 
+                // If Game Over (fall to ground)
+                else if (state.current === state.over) {
+                    if (this.y + this.h/2 < canvas.height/scale - ground.h) {
+                        this.speed += GRAVITY;
+                        this.y += this.speed;
+                        this.rotation = 90 * Math.PI / 180; // Face plant
+                    } else {
+                        this.y = canvas.height/scale - ground.h - this.h/2;
+                    }
+                }
+            },
+            
+            reset: function() {
+                this.speed = 0;
+                this.rotation = 0;
+                this.y = 150;
+            }
+        };
+
+        const pipes = {
+            position: [],
+            w: 52,
+            h: 400, // Max height of pipe sprite
+            dx: 2,
+
+            draw: function() {
+                for (let i = 0; i < this.position.length; i++) {
+                    let p = this.position[i];
+                    let topY = p.y;
+                    let bottomY = p.y + this.h + PIPE_GAP;
+
+                    // Draw Top Pipe
+                    if (images.pipeTop.complete && images.pipeTop.naturalWidth !== 0) {
+                        // Determine where to draw based on sprite height.
+                        // The top pipe sprite hangs down. We draw it so its bottom touches topY.
+                        // We assume the sprite is long.
+                        ctx.drawImage(images.pipeTop, p.x, topY - 320 + this.h); // Adjust 320 based on actual sprite usage, simpler:
+                        // To be safe with unknown sprite height, we draw the 'cap' at the bottom of the top pipe
+                        // Let's just draw it at (p.x, p.y) assuming p.y is the bottom of the top pipe
+                        ctx.drawImage(images.pipeTop, p.x, p.y - images.pipeTop.height); 
+                    } else {
+                        ctx.fillStyle = '#73bf2e';
+                        ctx.fillRect(p.x, 0, this.w, p.y);
+                        ctx.strokeStyle = '#558c22';
+                        ctx.strokeRect(p.x, 0, this.w, p.y);
+                    }
+
+                    // Draw Bottom Pipe
+                    if (images.pipeBottom.complete && images.pipeBottom.naturalWidth !== 0) {
+                        ctx.drawImage(images.pipeBottom, p.x, bottomY);
+                    } else {
+                        ctx.fillStyle = '#73bf2e';
+                        ctx.fillRect(p.x, bottomY, this.w, GAME_HEIGHT - bottomY - ground.h);
+                        ctx.strokeStyle = '#558c22';
+                        ctx.strokeRect(p.x, bottomY, this.w, GAME_HEIGHT - bottomY - ground.h);
+                    }
+                }
+            },
+
+            update: function() {
+                if (state.current !== state.game) return;
+
+                // Add new pipe
+                if (frames % PIPE_SPAWN_RATE === 0) {
+                    // Random position
+                    // Min pipe height roughly 50px
+                    // Ground is at GAME_HEIGHT - 112
+                    // MaxY = GAME_HEIGHT - 112 - PIPE_GAP - 50
+                    const maxY = GAME_HEIGHT - ground.h - PIPE_GAP - 50;
+                    const minY = 50;
+                    const randomY = Math.floor(Math.random() * (maxY - minY + 1) + minY);
+                    
+                    this.position.push({
+                        x: GAME_WIDTH,
+                        y: randomY,
+                        passed: false
+                    });
+                }
+
+                for (let i = 0; i < this.position.length; i++) {
+                    let p = this.position[i];
+                    p.x -= this.dx;
+
+                    // Collision Logic
+                    // Bounding boxes
+                    let birdLeft = bird.x - bird.w/2 + 5; // padding
+                    let birdRight = bird.x + bird.w/2 - 5;
+                    let birdTop = bird.y - bird.h/2 + 5;
+                    let birdBottom = bird.y + bird.h/2 - 5;
+
+                    let pipeLeft = p.x;
+                    let pipeRight = p.x + this.w;
+                    let topPipeBottom = p.y;
+                    let bottomPipeTop = p.y + PIPE_GAP;
+
+                    // Check Collision with Top Pipe
+                    if (birdRight > pipeLeft && birdLeft < pipeRight && birdTop < topPipeBottom) {
+                        state.current = state.over;
+                        playSound('hit');
+                    }
+                    // Check Collision with Bottom Pipe
+                    if (birdRight > pipeLeft && birdLeft < pipeRight && birdBottom > bottomPipeTop) {
+                        state.current = state.over;
+                        playSound('hit');
+                    }
+
+                    // Score update
+                    if (p.x + this.w < birdLeft && !p.passed) {
+                        score += 1;
+                        p.passed = true;
+                        playSound('score');
+                        highScore = Math.max(score, highScore);
+                        localStorage.setItem('flappy_highscore', highScore);
+                    }
+
+                    // Remove pipes that have gone off screen
+                    if (p.x + this.w <= 0) {
+                        this.position.shift();
+                        i--; // correct index after removal
+                    }
+                }
+            },
+
+            reset: function() {
+                this.position = [];
+            }
+        };
+
+        const ui = {
+            draw: function() {
+                // Score (during game)
+                if (state.current === state.game) {
+                    ctx.fillStyle = "white";
+                    ctx.strokeStyle = "black";
+                    ctx.lineWidth = 2;
+                    ctx.font = "35px Impact";
+                    ctx.textAlign = "center";
+                    ctx.fillText(score, GAME_WIDTH/2, 50);
+                    ctx.strokeText(score, GAME_WIDTH/2, 50);
+                }
+
+                // Get Ready Screen
+                if (state.current === state.getReady) {
+                    // Draw Title
+                    if (images.title.complete && images.title.naturalWidth !== 0) {
+                        const tW = images.title.width;
+                        const tH = images.title.height;
+                        ctx.drawImage(images.title, GAME_WIDTH/2 - tW/2, 50);
+                    } else {
+                        ctx.fillStyle = "orange";
+                        ctx.font = "30px Impact";
+                        ctx.textAlign = "center";
+                        ctx.fillText("FLAPPY BIRD", GAME_WIDTH/2, 80);
+                    }
+
+                    // Draw "Get" "Ready!"
+                    // The user has separate sprites
+                    if (images.get.complete && images.ready.complete && images.get.naturalWidth !== 0) {
+                        const totalW = images.get.width + images.ready.width + 10;
+                        const startX = GAME_WIDTH/2 - totalW/2;
+                        ctx.drawImage(images.get, startX, 180);
+                        ctx.drawImage(images.ready, startX + images.get.width + 10, 180);
+                    } else {
+                        ctx.fillStyle = "white";
+                        ctx.font = "30px Impact";
+                        ctx.fillText("Get Ready!", GAME_WIDTH/2, 200);
+                    }
+
+                    // Draw Tap
+                    if (images.tap.complete && images.tap.naturalWidth !== 0) {
+                        ctx.drawImage(images.tap, GAME_WIDTH/2 - images.tap.width/2, 250);
+                    } else {
+                        ctx.fillText("(Tap to Start)", GAME_WIDTH/2, 250);
+                    }
+                }
+
+                // Game Over Screen
+                if (state.current === state.over) {
+                    ctx.fillStyle = "white";
+                    ctx.strokeStyle = "black";
+                    ctx.lineWidth = 2;
+                    ctx.font = "40px Impact";
+                    ctx.textAlign = "center";
+                    ctx.fillText("GAME OVER", GAME_WIDTH/2, 150);
+                    ctx.strokeText("GAME OVER", GAME_WIDTH/2, 150);
+
+                    ctx.font = "25px Impact";
+                    ctx.fillText("Score: " + score, GAME_WIDTH/2, 200);
+                    ctx.fillText("Best: " + highScore, GAME_WIDTH/2, 230);
+                    
+                    ctx.font = "20px Arial";
+                    ctx.fillText("Tap to restart", GAME_WIDTH/2, 300);
+                }
+            }
+        }
+
+        // --- MAIN LOOPS ---
+
+        function draw() {
+            // Clear Canvas
+            ctx.fillStyle = "#70c5ce";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Apply Scale for "Pixel Perfect" look relative to standard width
+            ctx.save();
+            ctx.scale(scale, scale);
+
+            bg.draw();
+            pipes.draw();
+            ground.draw(); // Ground over pipes
+            bird.draw();
+            ui.draw();
+
+            ctx.restore();
+        }
+
+        function update() {
+            bird.update();
+            ground.update();
+            pipes.update();
+        }
+
+        function loop() {
+            update();
+            draw();
+            frames++;
+            requestAnimationFrame(loop);
+        }
+
+        // --- CONTROLS ---
+
+        function handleInput() {
+            switch (state.current) {
+                case state.getReady:
+                    state.current = state.game;
+                    bird.flap();
+                    break;
+                case state.game:
+                    bird.flap();
+                    break;
+                case state.over:
+                    bird.reset();
+                    pipes.reset();
+                    score = 0;
+                    frames = 0;
+                    state.current = state.getReady;
+                    break;
+            }
+        }
+
+        window.addEventListener("click", handleInput);
+        window.addEventListener("keydown", (e) => {
+            if (e.code === "Space" || e.code === "ArrowUp") {
+                handleInput();
+            }
+        });
+        window.addEventListener("touchstart", (e) => {
+            e.preventDefault(); // Prevent zoom/scroll
+            handleInput();
+        }, {passive: false});
+
+        // Initialize
+        loadImages(() => {
+            document.getElementById('loading').style.display = 'none';
+            loop();
+        });
+
+    </script>
+</body>
+</html>
+
+
